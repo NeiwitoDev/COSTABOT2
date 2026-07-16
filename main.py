@@ -1,168 +1,173 @@
 """
-Bot de Discord Principal
-Sistemas: Bienvenida, AutoMod, Bot Setup, Tickets
-Inicia con: DISCORD_BOT_TOKEN en variables de entorno
+Comando /bot-setup
+Configura el prefix y el canal de logs de sanciones automáticas.
 """
-import os
-import sys
-import asyncio
-import logging
-from keep_alive import keep_alive
-
 import discord
+from discord import app_commands
 from discord.ext import commands
-
-# Cargar variables de entorno desde .env si existe
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 import database as db
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("bot")
+class BotSetupModal(discord.ui.Modal, title="⚙️ Configurar Bot"):
+    prefix = discord.ui.TextInput(
+        label="Prefix del bot",
+        placeholder="Ej: ! / $ / > / ?",
+        default="!",
+        required=True,
+        max_length=5,
+    )
+    log_channel = discord.ui.TextInput(
+        label="Canal de logs de sanciones (ID)",
+        placeholder="Ej: 123456789012345678",
+        required=False,
+        max_length=20,
+    )
+    automod_flood = discord.ui.TextInput(
+        label="Umbral de flood (mensajes antes de sancionar)",
+        placeholder="Ej: 5  (por defecto: 5 mensajes)",
+        default="5",
+        required=False,
+        max_length=3,
+    )
+    automod_interval = discord.ui.TextInput(
+        label="Intervalo de flood (segundos)",
+        placeholder="Ej: 5  (por defecto: 5 segundos)",
+        default="5",
+        required=False,
+        max_length=3,
+    )
 
-# ─── Intents ──────────────────────────────────────────────────────────────────
+    def __init__(self, existing_guild: dict | None = None, existing_automod: dict | None = None):
+        super().__init__()
+        if existing_guild:
+            self.prefix.default = existing_guild.get("prefix") or "!"
+            log_ch = existing_guild.get("log_channel_id")
+            if log_ch:
+                self.log_channel.default = str(log_ch)
+        if existing_automod:
+            self.automod_flood.default = str(existing_automod.get("flood_threshold") or 5)
+            self.automod_interval.default = str(existing_automod.get("flood_interval") or 5)
 
-intents = discord.Intents.default()
-intents.message_content = True   # Necesario para automod
-intents.members = True            # Necesario para on_member_join (bienvenidas)
-intents.guilds = True
+    async def on_submit(self, interaction: discord.Interaction):
+        prefix = self.prefix.value.strip() or "!"
 
-# ─── Bot ──────────────────────────────────────────────────────────────────────
-
-COGS = [
-    "cogs.welcome",
-    "cogs.automod",
-    "cogs.setup",
-    "cogs.tickets",
-    "cogs.embed",
-    "cogs.moderation",
-    "cogs.help",
-]
-
-
-class Bot(commands.Bot):
-    def __init__(self):
-        super().__init__(
-            command_prefix=self._get_prefix,
-            intents=intents,
-            description="Bot con sistemas de bienvenida, automod y tickets.",
-            help_command=None,
-        )
-        # Cache de prefixes por guild (se carga de la BD en on_ready)
-        self._prefix_cache: dict[int, str] = {}
-
-    async def _get_prefix(self, bot: "Bot", message: discord.Message) -> list[str]:
-        if message.guild:
-            prefix = self._prefix_cache.get(message.guild.id, "!")
-        else:
-            prefix = "!"
-        return commands.when_mentioned_or(prefix)(bot, message)
-
-    async def setup_hook(self):
-        # Inicializar la base de datos
-        await db.init_db()
-        log.info("Base de datos inicializada.")
-
-        # Cargar cogs
-        for cog in COGS:
+        # Canal de logs
+        log_channel_id = None
+        log_channel_mention = "No configurado"
+        log_channel_str = self.log_channel.value.strip()
+        if log_channel_str:
             try:
-                await self.load_extension(cog)
-                log.info(f"Cog cargado: {cog}")
-            except Exception as e:
-                log.error(f"Error cargando cog {cog}: {e}")
+                log_channel_id = int(log_channel_str)
+                ch = interaction.guild.get_channel(log_channel_id)
+                if not ch:
+                    await interaction.response.send_message(
+                        "❌ No encontré el canal de logs en este servidor.", ephemeral=True
+                    )
+                    return
+                log_channel_mention = ch.mention
+            except ValueError:
+                await interaction.response.send_message(
+                    "❌ El ID del canal de logs no es válido.", ephemeral=True
+                )
+                return
 
-        # Sincronizar slash commands globalmente
-        synced = await self.tree.sync()
-        log.info(f"Sincronizados {len(synced)} comando(s) de slash.")
-
-    async def on_ready(self):
-        log.info(f"Bot conectado como {self.user} (ID: {self.user.id})")
-        log.info(f"Servidores: {len(self.guilds)}")
-
-        # Precargar prefixes de la BD
-        for guild in self.guilds:
-            settings = await db.get_guild_settings(guild.id)
-            if settings:
-                self._prefix_cache[guild.id] = settings.get("prefix") or "!"
-
-        await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name=f"{len(self.guilds)} CostaRP - Dev: Neiwito.",
-            )
-        )
-        log.info("Bot listo.")
-
-    async def on_guild_join(self, guild: discord.Guild):
-        log.info(f"Nuevo servidor: {guild.name} (ID: {guild.id})")
-        await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name=f"{len(self.guilds)} CostaRP - Dev: Neiwito.",
-            )
-        )
-
-    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
-        if isinstance(error, commands.CommandNotFound):
-            return
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.send("❌ No tienes permisos para usar este comando.", delete_after=5)
-            return
-        log.error(f"Error en comando: {error}", exc_info=error)
-
-    async def on_app_command_error(
-        self,
-        interaction: discord.Interaction,
-        error: discord.app_commands.AppCommandError,
-    ):
-        msg = "❌ Ocurrió un error al ejecutar el comando."
-        if isinstance(error, discord.app_commands.MissingPermissions):
-            msg = "❌ No tienes permisos para usar este comando."
+        # Flood settings
         try:
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
-        log.error(f"Error en slash command: {error}", exc_info=error)
+            flood_threshold = int(self.automod_flood.value.strip() or "5")
+            flood_threshold = max(2, min(flood_threshold, 50))
+        except ValueError:
+            flood_threshold = 5
+
+        try:
+            flood_interval = int(self.automod_interval.value.strip() or "5")
+            flood_interval = max(1, min(flood_interval, 60))
+        except ValueError:
+            flood_interval = 5
+
+        # Guardar configuración
+        guild_kwargs: dict = {"prefix": prefix}
+        if log_channel_id:
+            guild_kwargs["log_channel_id"] = log_channel_id
+
+        await db.set_guild_settings(interaction.guild_id, **guild_kwargs)
+        await db.set_automod_settings(
+            interaction.guild_id,
+            flood_threshold=flood_threshold,
+            flood_interval=flood_interval,
+            log_channel_id=log_channel_id,
+            enabled=1,
+            flood_enabled=1,
+            links_enabled=1,
+        )
+
+        # Actualizar prefix en el caché del bot en caliente
+        interaction.client._prefix_cache[interaction.guild_id] = prefix
+
+        embed = discord.Embed(
+            title="✅ Configuración del bot guardada",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Prefix", value=f"`{prefix}`", inline=True)
+        embed.add_field(name="Canal de logs", value=log_channel_mention, inline=True)
+        embed.add_field(
+            name="AutoMod — Flood",
+            value=f"**{flood_threshold}** mensajes en **{flood_interval}s**",
+            inline=False,
+        )
+        embed.add_field(
+            name="AutoMod — Links",
+            value="✅ Activo",
+            inline=True,
+        )
+        embed.set_footer(text="Usa /welcome-setup y /tickets-setup para configurar los demás sistemas.")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+class SetupCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
 
-def main():
-    token = os.environ.get("DISCORD_BOT_TOKEN")
-    keep_alive()
-    if not token:
-        log.critical("DISCORD_BOT_TOKEN no está configurado. Configúralo como variable de entorno.")
-        sys.exit(1)
+    @app_commands.command(
+        name="bot-setup",
+        description="Configura el prefix y el canal de logs de sanciones.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def configurar_bot(self, interaction: discord.Interaction):
+        existing_guild = await db.get_guild_settings(interaction.guild_id)
+        existing_automod = await db.get_automod_settings(interaction.guild_id)
+        modal = BotSetupModal(existing_guild=existing_guild, existing_automod=existing_automod)
+        await interaction.response.send_modal(modal)
 
-    bot = Bot()
+    @app_commands.command(
+        name="advertencias",
+        description="Muestra las advertencias de automod de un usuario.",
+    )
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.describe(usuario="El usuario del que quieres ver las advertencias")
+    async def warnings(self, interaction: discord.Interaction, usuario: discord.Member):
+        warns = await db.get_warnings(interaction.guild_id, usuario.id)
+        if not warns:
+            await interaction.response.send_message(
+                f"✅ **{usuario}** no tiene advertencias registradas.", ephemeral=True
+            )
+            return
 
-    try:
-        asyncio.run(bot.start(token))
-    except KeyboardInterrupt:
-        log.info("Bot detenido manualmente.")
-    except discord.LoginFailure:
-        log.critical("Token inválido. Verifica DISCORD_BOT_TOKEN.")
-        sys.exit(1)
-    except Exception as e:
-        log.critical(f"Error fatal: {e}", exc_info=e)
-        sys.exit(1)
+        embed = discord.Embed(
+            title=f"⚠️ Advertencias de {usuario}",
+            color=discord.Color.orange(),
+        )
+        for i, w in enumerate(warns[:10], 1):
+            embed.add_field(
+                name=f"#{i} — {w['reason']}",
+                value=f"<t:{int(__import__('datetime').datetime.fromisoformat(w['timestamp']).timestamp())}:R>",
+                inline=False,
+            )
+        embed.set_thumbnail(url=usuario.display_avatar.url)
+        embed.set_footer(text=f"Total: {len(warns)} advertencias")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-if __name__ == "__main__":
-    main()
+async def setup(bot: commands.Bot):
+    await bot.add_cog(SetupCog(bot))

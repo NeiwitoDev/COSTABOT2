@@ -1,366 +1,476 @@
 """
-Módulo de base de datos - SQLite async
+Comandos de Moderación
+Prefijo: ? (configurable por servidor)
+
+?lock [#canal] [tiempo]   — Bloquea el canal
+?unlock [#canal]          — Desbloquea el canal
+?kick <@user> [motivo]    — Expulsa a un usuario
+?ban <@user|id> [motivo]  — Banea permanentemente
+?unban <user_id> [motivo] — Desbanea por ID
+?tempban <@user|id> <tiempo> [motivo] — Baneo temporal
+?warn <@user> <motivo>    — Registra una advertencia
+?delwarn <@user> <id>     — Elimina una advertencia por ID
+?warns <@user>            — Muestra las advertencias de un usuario
 """
-import aiosqlite
-import os
+from __future__ import annotations
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "bot.db")
+import asyncio
+import re
+from datetime import datetime, timezone, timedelta
 
+import discord
+from discord.ext import commands
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id       INTEGER PRIMARY KEY,
-                log_channel_id INTEGER,
-                prefix         TEXT DEFAULT '?'
-            );
-
-            CREATE TABLE IF NOT EXISTS welcome_settings (
-                guild_id             INTEGER PRIMARY KEY,
-                channel_id           INTEGER,
-                message              TEXT DEFAULT '¡Bienvenido/a {user} a **{server}**!',
-                embed_color          TEXT DEFAULT '#5865F2',
-                image_url            TEXT,
-                recommended_channels TEXT,
-                dm_message           TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS automod_settings (
-                guild_id        INTEGER PRIMARY KEY,
-                enabled         INTEGER DEFAULT 1,
-                flood_enabled   INTEGER DEFAULT 1,
-                flood_threshold INTEGER DEFAULT 5,
-                flood_interval  INTEGER DEFAULT 5,
-                links_enabled   INTEGER DEFAULT 1,
-                log_channel_id  INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS automod_warnings (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id  INTEGER NOT NULL,
-                user_id   INTEGER NOT NULL,
-                reason    TEXT NOT NULL,
-                timestamp TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ticket_settings (
-                guild_id         INTEGER PRIMARY KEY,
-                panel_channel_id INTEGER,
-                log_channel_id   INTEGER,
-                panel_message    TEXT DEFAULT '¿Necesitas ayuda? Abre un ticket y te atenderemos lo antes posible.',
-                open_type        TEXT DEFAULT 'button',
-                support_role_id  INTEGER,
-                category_id      INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS ticket_categories (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id    INTEGER NOT NULL,
-                name        TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                emoji       TEXT DEFAULT '🎫'
-            );
-
-            CREATE TABLE IF NOT EXISTS tickets (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id    INTEGER NOT NULL,
-                user_id     INTEGER NOT NULL,
-                channel_id  INTEGER NOT NULL,
-                category_id INTEGER,
-                claimed_by  INTEGER,
-                status      TEXT DEFAULT 'open',
-                created_at  TEXT NOT NULL,
-                closed_at   TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS mod_warnings (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id     INTEGER NOT NULL,
-                user_id      INTEGER NOT NULL,
-                moderator_id INTEGER NOT NULL,
-                reason       TEXT NOT NULL,
-                timestamp    TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS temp_bans (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id     INTEGER NOT NULL,
-                user_id      INTEGER NOT NULL,
-                moderator_id INTEGER NOT NULL,
-                reason       TEXT,
-                unban_at     TEXT NOT NULL,
-                unbanned     INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS embed_menu_items (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id   INTEGER NOT NULL,
-                guild_id     INTEGER NOT NULL,
-                label        TEXT NOT NULL,
-                description  TEXT,
-                emoji        TEXT,
-                response_msg TEXT NOT NULL
-            );
-            """
-        )
-        await db.commit()
+import database as db
 
 
-# ─── Helper genérico upsert ──────────────────────────────────────────────────
+# ─── Utilidades ───────────────────────────────────────────────────────────────
 
-async def _upsert(table: str, pk: str, pk_val: int, **kwargs):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(f"SELECT {pk} FROM {table} WHERE {pk} = ?", (pk_val,))
-        if await cur.fetchone():
-            sets = ", ".join(f"{k} = ?" for k in kwargs)
-            await db.execute(f"UPDATE {table} SET {sets} WHERE {pk} = ?", (*kwargs.values(), pk_val))
-        else:
-            cols = f"{pk}, " + ", ".join(kwargs.keys())
-            vals = "?, " + ", ".join("?" for _ in kwargs)
-            await db.execute(f"INSERT INTO {table} ({cols}) VALUES ({vals})", (pk_val, *kwargs.values()))
-        await db.commit()
+def parse_duration(text: str) -> timedelta | None:
+    """Convierte '1d2h30m' en un timedelta. Retorna None si el formato es inválido."""
+    pattern = re.fullmatch(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text.strip().lower())
+    if not pattern or not any(pattern.groups()):
+        return None
+    d, h, m, s = (int(x) if x else 0 for x in pattern.groups())
+    return timedelta(days=d, hours=h, minutes=m, seconds=s)
 
 
-async def _fetchone(table: str, pk: str, pk_val: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(f"SELECT * FROM {table} WHERE {pk} = ?", (pk_val,)) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+def format_duration(td: timedelta) -> str:
+    total = int(td.total_seconds())
+    d, rem = divmod(total, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if s: parts.append(f"{s}s")
+    return " ".join(parts) or "0s"
 
 
-# ─── Guild settings ──────────────────────────────────────────────────────────
-
-async def get_guild_settings(guild_id: int) -> dict | None:
-    return await _fetchone("guild_settings", "guild_id", guild_id)
-
-
-async def set_guild_settings(guild_id: int, **kwargs):
-    await _upsert("guild_settings", "guild_id", guild_id, **kwargs)
-
-
-# ─── Welcome settings ─────────────────────────────────────────────────────────
-
-async def get_welcome_settings(guild_id: int) -> dict | None:
-    return await _fetchone("welcome_settings", "guild_id", guild_id)
+async def send_modlog(guild: discord.Guild, embed: discord.Embed):
+    """Envía al canal de logs de moderación si está configurado."""
+    settings = await db.get_guild_settings(guild.id)
+    if settings and settings.get("log_channel_id"):
+        ch = guild.get_channel(settings["log_channel_id"])
+        if ch:
+            try:
+                await ch.send(embed=embed)
+            except discord.Forbidden:
+                pass
 
 
-async def set_welcome_settings(guild_id: int, **kwargs):
-    await _upsert("welcome_settings", "guild_id", guild_id, **kwargs)
+def mod_embed(
+    action: str,
+    color: discord.Color,
+    moderator: discord.Member,
+    target: discord.User | discord.Member,
+    reason: str | None,
+    extra: str | None = None,
+) -> discord.Embed:
+    embed = discord.Embed(title=f"🔨 {action}", color=color, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Usuario", value=f"{target.mention} (`{target.id}`)", inline=True)
+    embed.add_field(name="Moderador", value=moderator.mention, inline=True)
+    embed.add_field(name="Motivo", value=reason or "Sin motivo", inline=False)
+    if extra:
+        embed.add_field(name="Detalles", value=extra, inline=False)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    return embed
 
 
-async def reset_welcome_settings(guild_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM welcome_settings WHERE guild_id = ?", (guild_id,))
-        await db.commit()
+# ─── Cog ──────────────────────────────────────────────────────────────────────
 
+class ModerationCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # canal_id → asyncio.Task de desbloqueo programado
+        self._unlock_tasks: dict[int, asyncio.Task] = {}
 
-# ─── Automod settings ─────────────────────────────────────────────────────────
+    async def cog_load(self):
+        """Al cargar el cog, reprogramar tempbans pendientes."""
+        await self._reschedule_tempbans()
 
-async def get_automod_settings(guild_id: int) -> dict | None:
-    return await _fetchone("automod_settings", "guild_id", guild_id)
-
-
-async def set_automod_settings(guild_id: int, **kwargs):
-    await _upsert("automod_settings", "guild_id", guild_id, **kwargs)
-
-
-async def add_warning(guild_id: int, user_id: int, reason: str):
-    from datetime import datetime, timezone
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO automod_warnings (guild_id, user_id, reason, timestamp) VALUES (?,?,?,?)",
-            (guild_id, user_id, reason, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
-
-
-async def get_warnings(guild_id: int, user_id: int) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM automod_warnings WHERE guild_id = ? AND user_id = ? ORDER BY id DESC",
-            (guild_id, user_id),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-
-# ─── Mod warnings (moderación manual) ────────────────────────────────────────
-
-async def add_mod_warning(guild_id: int, user_id: int, moderator_id: int, reason: str) -> int:
-    from datetime import datetime, timezone
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO mod_warnings (guild_id, user_id, moderator_id, reason, timestamp) VALUES (?,?,?,?,?)",
-            (guild_id, user_id, moderator_id, reason, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
-        return cur.lastrowid
-
-
-async def get_mod_warnings(guild_id: int, user_id: int) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM mod_warnings WHERE guild_id = ? AND user_id = ? ORDER BY id DESC",
-            (guild_id, user_id),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-
-async def count_mod_warnings(guild_id: int, user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM mod_warnings WHERE guild_id = ? AND user_id = ?",
-            (guild_id, user_id),
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
-
-
-async def delete_mod_warning(warn_id: int, guild_id: int, user_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "DELETE FROM mod_warnings WHERE id = ? AND guild_id = ? AND user_id = ?",
-            (warn_id, guild_id, user_id),
-        )
-        await db.commit()
-        return cur.rowcount > 0
-
-
-# ─── Temp bans ────────────────────────────────────────────────────────────────
-
-async def add_temp_ban(guild_id: int, user_id: int, moderator_id: int, reason: str | None, unban_at: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO temp_bans (guild_id, user_id, moderator_id, reason, unban_at) VALUES (?,?,?,?,?)",
-            (guild_id, user_id, moderator_id, reason, unban_at),
-        )
-        await db.commit()
-        return cur.lastrowid
-
-
-async def get_pending_temp_bans() -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM temp_bans WHERE unbanned = 0") as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-
-async def mark_temp_ban_done(ban_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE temp_bans SET unbanned = 1 WHERE id = ?", (ban_id,))
-        await db.commit()
-
-
-# ─── Embed menu items ─────────────────────────────────────────────────────────
-
-async def save_embed_menu_items(message_id: int, guild_id: int, items: list[dict]) -> list[dict]:
-    """Guarda todos los items de un menú y retorna la lista con sus IDs de BD."""
-    result = []
-    async with aiosqlite.connect(DB_PATH) as db:
-        for item in items:
-            cur = await db.execute(
-                "INSERT INTO embed_menu_items (message_id, guild_id, label, description, emoji, response_msg) VALUES (?,?,?,?,?,?)",
-                (message_id, guild_id, item["label"], item.get("description"), item.get("emoji"), item["response_msg"]),
+    async def _reschedule_tempbans(self):
+        pending = await db.get_pending_temp_bans()
+        for ban in pending:
+            unban_at = datetime.fromisoformat(ban["unban_at"]).replace(tzinfo=timezone.utc)
+            delay = (unban_at - datetime.now(timezone.utc)).total_seconds()
+            if delay <= 0:
+                delay = 0
+            self.bot.loop.create_task(
+                self._do_unban(ban["guild_id"], ban["user_id"], ban["id"], max(delay, 0))
             )
-            result.append({**item, "id": cur.lastrowid})
-        await db.commit()
-    return result
 
-
-async def get_embed_menu_items(message_id: int) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM embed_menu_items WHERE message_id = ? ORDER BY id ASC",
-            (message_id,),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-
-async def get_all_embed_menus() -> dict[int, list[dict]]:
-    """Retorna todos los menús agrupados por message_id. Usado en cog_load para re-registrar vistas persistentes."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM embed_menu_items ORDER BY message_id, id ASC") as cur:
-            rows = [dict(r) for r in await cur.fetchall()]
-    result: dict[int, list[dict]] = {}
-    for row in rows:
-        result.setdefault(row["message_id"], []).append(row)
-    return result
-
-
-# ─── Ticket settings ──────────────────────────────────────────────────────────
-
-async def get_ticket_settings(guild_id: int) -> dict | None:
-    return await _fetchone("ticket_settings", "guild_id", guild_id)
-
-
-async def set_ticket_settings(guild_id: int, **kwargs):
-    await _upsert("ticket_settings", "guild_id", guild_id, **kwargs)
-
-
-async def add_ticket_category(guild_id: int, name: str, description: str, emoji: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO ticket_categories (guild_id, name, description, emoji) VALUES (?,?,?,?)",
-            (guild_id, name, description, emoji),
+    async def _do_unban(self, guild_id: int, user_id: int, ban_id: int, delay: float):
+        await asyncio.sleep(delay)
+        await db.mark_temp_ban_done(ban_id)
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        try:
+            await guild.unban(discord.Object(id=user_id), reason="Tempban expirado")
+        except (discord.NotFound, discord.Forbidden):
+            pass
+        # Notificar al canal de logs
+        user = await self.bot.fetch_user(user_id)
+        embed = discord.Embed(
+            title="⏱️ Tempban expirado",
+            description=f"{user.mention} (`{user_id}`) fue desbaneado automáticamente.",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
         )
-        await db.commit()
-        return cur.lastrowid
+        await send_modlog(guild, embed)
 
+    async def _do_unlock(self, channel: discord.TextChannel, delay: float):
+        await asyncio.sleep(delay)
+        overwrites = channel.overwrites_for(channel.guild.default_role)
+        overwrites.send_messages = None  # Restablecer al default
+        try:
+            await channel.set_permissions(channel.guild.default_role, overwrite=overwrites)
+            await channel.send("🔓 Canal desbloqueado automáticamente.")
+        except discord.Forbidden:
+            pass
+        self._unlock_tasks.pop(channel.id, None)
 
-async def get_ticket_categories(guild_id: int) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM ticket_categories WHERE guild_id = ?", (guild_id,)) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    # ── Checks comunes ────────────────────────────────────────────────────────
 
+    async def _check_hierarchy(self, ctx: commands.Context, target: discord.Member) -> bool:
+        if target == ctx.author:
+            await ctx.send("❌ No puedes moderarte a ti mismo.", delete_after=5)
+            return False
+        if target == ctx.guild.owner:
+            await ctx.send("❌ No puedes moderar al dueño del servidor.", delete_after=5)
+            return False
+        if ctx.author != ctx.guild.owner and target.top_role >= ctx.author.top_role:
+            await ctx.send("❌ No puedes moderar a alguien con el mismo rol o superior.", delete_after=5)
+            return False
+        if target.top_role >= ctx.guild.me.top_role:
+            await ctx.send("❌ No tengo permisos para moderar a ese usuario (rol superior al mío).", delete_after=5)
+            return False
+        return True
 
-async def delete_ticket_category(category_id: int, guild_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM ticket_categories WHERE id = ? AND guild_id = ?",
-            (category_id, guild_id),
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?lock [#canal] [tiempo]
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="lock")
+    @commands.has_permissions(manage_channels=True)
+    @commands.guild_only()
+    async def lock(self, ctx: commands.Context, channel: discord.TextChannel = None, *, tiempo: str = None):
+        """Bloquea un canal. Opcional: especifica tiempo (ej: 30m, 1h, 2d)."""
+        target = channel or ctx.channel
+        everyone = target.guild.default_role
+        overwrites = target.overwrites_for(everyone)
+        overwrites.send_messages = False
+
+        duration = None
+        if tiempo:
+            duration = parse_duration(tiempo)
+            if not duration:
+                await ctx.send("❌ Formato de tiempo inválido. Usa: `30m`, `1h`, `2d`, `1h30m`…", delete_after=5)
+                return
+
+        try:
+            await target.set_permissions(everyone, overwrite=overwrites)
+        except discord.Forbidden:
+            await ctx.send("❌ No tengo permisos para modificar ese canal.", delete_after=5)
+            return
+
+        # Cancelar tarea anterior si existía
+        old_task = self._unlock_tasks.pop(target.id, None)
+        if old_task:
+            old_task.cancel()
+
+        extra = f"Duración: {format_duration(duration)}" if duration else None
+        embed = mod_embed("Canal bloqueado 🔒", discord.Color.red(), ctx.author, ctx.author, None, extra)
+        embed.add_field(name="Canal", value=target.mention, inline=True)
+
+        if duration:
+            task = self.bot.loop.create_task(self._do_unlock(target, duration.total_seconds()))
+            self._unlock_tasks[target.id] = task
+            await target.send(
+                embed=discord.Embed(
+                    title="🔒 Canal bloqueado",
+                    description=f"Este canal ha sido bloqueado por {format_duration(duration)}.",
+                    color=discord.Color.red(),
+                )
+            )
+        else:
+            await target.send(
+                embed=discord.Embed(
+                    title="🔒 Canal bloqueado",
+                    description="Este canal ha sido bloqueado por un moderador.",
+                    color=discord.Color.red(),
+                )
+            )
+
+        if target != ctx.channel:
+            await ctx.send(f"🔒 Canal {target.mention} bloqueado.", delete_after=5)
+
+        await send_modlog(ctx.guild, embed)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?unlock [#canal]
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="unlock")
+    @commands.has_permissions(manage_channels=True)
+    @commands.guild_only()
+    async def unlock(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Desbloquea un canal."""
+        target = channel or ctx.channel
+        everyone = target.guild.default_role
+        overwrites = target.overwrites_for(everyone)
+        overwrites.send_messages = None  # Restaurar al default
+
+        # Cancelar unlock automático si estaba programado
+        task = self._unlock_tasks.pop(target.id, None)
+        if task:
+            task.cancel()
+
+        try:
+            await target.set_permissions(everyone, overwrite=overwrites)
+        except discord.Forbidden:
+            await ctx.send("❌ No tengo permisos para modificar ese canal.", delete_after=5)
+            return
+
+        await target.send(
+            embed=discord.Embed(
+                title="🔓 Canal desbloqueado",
+                description="Este canal ha sido desbloqueado.",
+                color=discord.Color.green(),
+            )
         )
-        await db.commit()
+        if target != ctx.channel:
+            await ctx.send(f"🔓 Canal {target.mention} desbloqueado.", delete_after=5)
 
+        embed = mod_embed("Canal desbloqueado 🔓", discord.Color.green(), ctx.author, ctx.author, None)
+        embed.add_field(name="Canal", value=target.mention, inline=True)
+        await send_modlog(ctx.guild, embed)
 
-async def create_ticket(guild_id: int, user_id: int, channel_id: int, category_id: int | None) -> int:
-    from datetime import datetime, timezone
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO tickets (guild_id, user_id, channel_id, category_id, created_at) VALUES (?,?,?,?,?)",
-            (guild_id, user_id, channel_id, category_id, datetime.now(timezone.utc).isoformat()),
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?kick <@user> [motivo]
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="kick")
+    @commands.has_permissions(kick_members=True)
+    @commands.guild_only()
+    async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = None):
+        """Expulsa a un miembro del servidor."""
+        if not await self._check_hierarchy(ctx, member):
+            return
+        try:
+            await member.send(
+                embed=discord.Embed(
+                    title="👢 Has sido expulsado",
+                    description=f"**Servidor:** {ctx.guild.name}\n**Motivo:** {reason or 'Sin motivo'}",
+                    color=discord.Color.orange(),
+                )
+            )
+        except discord.Forbidden:
+            pass
+        await member.kick(reason=f"{ctx.author} — {reason or 'Sin motivo'}")
+        embed = mod_embed("Kick", discord.Color.orange(), ctx.author, member, reason)
+        await ctx.send(embed=embed)
+        await send_modlog(ctx.guild, embed)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?ban <@user|id> [motivo]
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="ban")
+    @commands.has_permissions(ban_members=True)
+    @commands.guild_only()
+    async def ban(self, ctx: commands.Context, user: discord.User, *, reason: str = None):
+        """Banea permanentemente a un usuario (acepta mención o ID)."""
+        member = ctx.guild.get_member(user.id)
+        if member:
+            if not await self._check_hierarchy(ctx, member):
+                return
+            try:
+                await member.send(
+                    embed=discord.Embed(
+                        title="🔨 Has sido baneado",
+                        description=f"**Servidor:** {ctx.guild.name}\n**Motivo:** {reason or 'Sin motivo'}",
+                        color=discord.Color.dark_red(),
+                    )
+                )
+            except discord.Forbidden:
+                pass
+        await ctx.guild.ban(user, reason=f"{ctx.author} — {reason or 'Sin motivo'}", delete_message_days=0)
+        embed = mod_embed("Ban", discord.Color.dark_red(), ctx.author, user, reason)
+        await ctx.send(embed=embed)
+        await send_modlog(ctx.guild, embed)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?unban <user_id> [motivo]
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="unban")
+    @commands.has_permissions(ban_members=True)
+    @commands.guild_only()
+    async def unban(self, ctx: commands.Context, user_id: int, *, reason: str = None):
+        """Desbanea a un usuario por su ID."""
+        try:
+            user = await self.bot.fetch_user(user_id)
+            await ctx.guild.unban(user, reason=f"{ctx.author} — {reason or 'Sin motivo'}")
+        except discord.NotFound:
+            await ctx.send("❌ Usuario no encontrado o no está baneado.", delete_after=5)
+            return
+        except discord.Forbidden:
+            await ctx.send("❌ No tengo permisos para desbanear.", delete_after=5)
+            return
+        embed = mod_embed("Unban", discord.Color.green(), ctx.author, user, reason)
+        await ctx.send(embed=embed)
+        await send_modlog(ctx.guild, embed)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?tempban <@user|id> <tiempo> [motivo]
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="tempban")
+    @commands.has_permissions(ban_members=True)
+    @commands.guild_only()
+    async def tempban(self, ctx: commands.Context, user: discord.User, tiempo: str, *, reason: str = None):
+        """Banea temporalmente. Ej: ?tempban @user 1d Raid"""
+        duration = parse_duration(tiempo)
+        if not duration:
+            await ctx.send("❌ Formato de tiempo inválido. Usa: `30m`, `1h`, `2d`…", delete_after=5)
+            return
+
+        member = ctx.guild.get_member(user.id)
+        if member:
+            if not await self._check_hierarchy(ctx, member):
+                return
+            try:
+                await member.send(
+                    embed=discord.Embed(
+                        title="⏱️ Has sido baneado temporalmente",
+                        description=(
+                            f"**Servidor:** {ctx.guild.name}\n"
+                            f"**Duración:** {format_duration(duration)}\n"
+                            f"**Motivo:** {reason or 'Sin motivo'}"
+                        ),
+                        color=discord.Color.red(),
+                    )
+                )
+            except discord.Forbidden:
+                pass
+
+        unban_at = datetime.now(timezone.utc) + duration
+        await ctx.guild.ban(user, reason=f"[TEMPBAN {format_duration(duration)}] {ctx.author} — {reason or 'Sin motivo'}", delete_message_days=0)
+        ban_id = await db.add_temp_ban(ctx.guild.id, user.id, ctx.author.id, reason, unban_at.isoformat())
+        self.bot.loop.create_task(self._do_unban(ctx.guild.id, user.id, ban_id, duration.total_seconds()))
+
+        embed = mod_embed("Tempban", discord.Color.red(), ctx.author, user, reason, f"Duración: {format_duration(duration)}")
+        await ctx.send(embed=embed)
+        await send_modlog(ctx.guild, embed)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?warn <@user> <motivo>
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="warn")
+    @commands.has_permissions(manage_messages=True)
+    @commands.guild_only()
+    async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
+        """Registra una advertencia para un miembro."""
+        if not await self._check_hierarchy(ctx, member):
+            return
+        warn_id = await db.add_mod_warning(ctx.guild.id, member.id, ctx.author.id, reason)
+        total = await db.count_mod_warnings(ctx.guild.id, member.id)
+        try:
+            await member.send(
+                embed=discord.Embed(
+                    title="⚠️ Has recibido una advertencia",
+                    description=(
+                        f"**Servidor:** {ctx.guild.name}\n"
+                        f"**Motivo:** {reason}\n"
+                        f"**Advertencia #:** {total}"
+                    ),
+                    color=discord.Color.yellow(),
+                )
+            )
+        except discord.Forbidden:
+            pass
+        embed = mod_embed("Warn", discord.Color.yellow(), ctx.author, member, reason, f"ID de advertencia: `#{warn_id}` · Total: {total}")
+        await ctx.send(embed=embed)
+        await send_modlog(ctx.guild, embed)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?delwarn <@user> <warn_id>
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="delwarn")
+    @commands.has_permissions(manage_messages=True)
+    @commands.guild_only()
+    async def delwarn(self, ctx: commands.Context, member: discord.Member, warn_id: int):
+        """Elimina una advertencia específica por su ID."""
+        deleted = await db.delete_mod_warning(warn_id, ctx.guild.id, member.id)
+        if not deleted:
+            await ctx.send(f"❌ No encontré la advertencia `#{warn_id}` para ese usuario.", delete_after=5)
+            return
+        total = await db.count_mod_warnings(ctx.guild.id, member.id)
+        await ctx.send(
+            embed=discord.Embed(
+                description=f"✅ Advertencia `#{warn_id}` de {member.mention} eliminada. Quedan **{total}** advertencia(s).",
+                color=discord.Color.green(),
+            )
         )
-        await db.commit()
-        return cur.lastrowid
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ?warns <@user>
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="warns")
+    @commands.has_permissions(manage_messages=True)
+    @commands.guild_only()
+    async def warns(self, ctx: commands.Context, member: discord.Member):
+        """Muestra todas las advertencias de un miembro."""
+        warnings = await db.get_mod_warnings(ctx.guild.id, member.id)
+        embed = discord.Embed(
+            title=f"⚠️ Advertencias de {member.display_name}",
+            color=discord.Color.yellow() if warnings else discord.Color.green(),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        if not warnings:
+            embed.description = "✅ Este usuario no tiene advertencias."
+        else:
+            lines = []
+            for w in warnings:
+                ts = datetime.fromisoformat(w["timestamp"]).strftime("%d/%m/%Y %H:%M")
+                mod = ctx.guild.get_member(w["moderator_id"])
+                mod_name = mod.display_name if mod else f"ID {w['moderator_id']}"
+                lines.append(f"`#{w['id']}` — {ts} · **Mod:** {mod_name}\n> {w['reason']}")
+            embed.description = "\n\n".join(lines)
+            embed.set_footer(text=f"Total: {len(warnings)} advertencia(s)")
+        await ctx.send(embed=embed)
+
+    # ─── Error handlers ────────────────────────────────────────────────────────
+
+    @lock.error
+    @unlock.error
+    @kick.error
+    @ban.error
+    @unban.error
+    @tempban.error
+    @warn.error
+    @delwarn.error
+    @warns.error
+    async def mod_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("❌ No tienes permisos para usar este comando.", delete_after=5)
+        elif isinstance(error, commands.MemberNotFound):
+            await ctx.send("❌ Usuario no encontrado. Usa una mención o ID válida.", delete_after=5)
+        elif isinstance(error, commands.UserNotFound):
+            await ctx.send("❌ Usuario no encontrado.", delete_after=5)
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"❌ Argumento requerido: `{error.param.name}`.", delete_after=5)
+        elif isinstance(error, commands.BadArgument):
+            await ctx.send("❌ Argumento inválido. Verifica el comando.", delete_after=5)
+        else:
+            await ctx.send(f"❌ Error inesperado: {error}", delete_after=8)
 
 
-async def get_ticket_by_channel(channel_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM tickets WHERE channel_id = ?", (channel_id,)) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
-
-
-async def update_ticket(channel_id: int, **kwargs):
-    async with aiosqlite.connect(DB_PATH) as db:
-        sets = ", ".join(f"{k} = ?" for k in kwargs)
-        await db.execute(f"UPDATE tickets SET {sets} WHERE channel_id = ?", (*kwargs.values(), channel_id))
-        await db.commit()
-
-
-async def get_open_ticket_by_user(guild_id: int, user_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM tickets WHERE guild_id = ? AND user_id = ? AND status != 'closed'",
-            (guild_id, user_id),
-        ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+async def setup(bot: commands.Bot):
+    await bot.add_cog(ModerationCog(bot))
