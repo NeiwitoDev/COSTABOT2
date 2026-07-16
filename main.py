@@ -7,6 +7,7 @@ import os
 import sys
 import asyncio
 import logging
+from keep_alive import keep_alive
 
 import discord
 from discord.ext import commands
