@@ -145,6 +145,7 @@ class Bot(commands.Bot):
 
 def main():
     token = os.environ.get("DISCORD_BOT_TOKEN")
+    keep_alive()
     if not token:
         log.critical("DISCORD_BOT_TOKEN no está configurado. Configúralo como variable de entorno.")
         sys.exit(1)
